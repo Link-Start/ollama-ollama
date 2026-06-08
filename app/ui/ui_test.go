@@ -14,7 +14,9 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/app/store"
 	"github.com/ollama/ollama/app/updater"
 )
@@ -526,6 +528,33 @@ func TestUserAgentTransport(t *testing.T) {
 	t.Logf("User-Agent transport successfully set: %s", receivedUA)
 }
 
+func TestInferenceClientUsesUserAgent(t *testing.T) {
+	var gotUserAgent atomic.Value
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUserAgent.Store(r.Header.Get("User-Agent"))
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{}`))
+	}))
+	defer ts.Close()
+
+	t.Setenv("OLLAMA_HOST", ts.URL)
+
+	server := &Server{}
+	client := server.inferenceClient()
+
+	_, err := client.Show(context.Background(), &api.ShowRequest{Model: "test"})
+	if err != nil {
+		t.Fatalf("show request failed: %v", err)
+	}
+
+	receivedUA, _ := gotUserAgent.Load().(string)
+	expectedUA := userAgent()
+
+	if receivedUA != expectedUA {
+		t.Errorf("User-Agent mismatch\nExpected: %s\nReceived: %s", expectedUA, receivedUA)
+	}
+}
+
 func TestSupportsBrowserTools(t *testing.T) {
 	tests := []struct {
 		model string
@@ -776,8 +805,13 @@ func TestSettingsToggleAutoUpdateOn_NoPendingUpdate_TriggersCheck(t *testing.T) 
 	// Initialize the checkNow channel by starting (and immediately stopping) the checker
 	// so TriggerImmediateCheck doesn't panic on nil channel
 	ctx, cancel := context.WithCancel(t.Context())
-	upd.StartBackgroundUpdaterChecker(ctx, func(string) error { return nil })
-	defer cancel()
+	stopped := upd.StartBackgroundUpdaterChecker(ctx, func(string) error { return nil })
+	cancel()
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background updater did not stop")
+	}
 
 	var notificationCalled atomic.Bool
 	server := &Server{
